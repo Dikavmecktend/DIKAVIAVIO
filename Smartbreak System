@@ -1,0 +1,902 @@
+/*************************************************
+ * SMARTBREAK SYSTEM
+ * Google Sheets Database + Apps Script API
+ *************************************************/
+
+const SPREADSHEET_ID =
+  '1OOWiokLwG0iKOqCzTgPDtCLNNwyZet2y';
+
+const TZ = 'Asia/Jakarta';
+
+const SHEET_KARYAWAN = 'KARYAWAN';
+const SHEET_ABSENSI = 'ABSENSI';
+const SHEET_SETTING = 'SETTING';
+const SHEET_LOG = 'LOG';
+
+
+/* =========================================
+   BASIC
+========================================= */
+
+function getDB() {
+  return SpreadsheetApp.openById(SPREADSHEET_ID);
+}
+
+
+function json(data) {
+  return ContentService
+    .createTextOutput(JSON.stringify(data))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+
+/* =========================================
+   INITIAL DATABASE
+========================================= */
+
+function setupDatabase() {
+
+  const ss = getDB();
+
+  createSheetIfMissing(
+    ss,
+    SHEET_KARYAWAN,
+    ['ID', 'NAMA', 'JABATAN', 'STORE', 'QR_ID', 'STATUS']
+  );
+
+  createSheetIfMissing(
+    ss,
+    SHEET_ABSENSI,
+    [
+      'TIMESTAMP',
+      'TANGGAL',
+      'JAM',
+      'ID',
+      'NAMA',
+      'STORE',
+      'TYPE'
+    ]
+  );
+
+  createSheetIfMissing(
+    ss,
+    SHEET_SETTING,
+    ['KEY', 'VALUE']
+  );
+
+  createSheetIfMissing(
+    ss,
+    SHEET_LOG,
+    ['TIMESTAMP', 'ACTION', 'ID', 'DETAIL']
+  );
+
+  const setting = ss.getSheetByName(SHEET_SETTING);
+
+  if (setting.getLastRow() <= 1) {
+
+    setting.getRange(2, 1, 3, 2).setValues([
+      ['TARGET_BREAK', 60],
+      ['BATAS_WARNING', 55],
+      ['BATAS_TERLAMBAT', 60]
+    ]);
+  }
+
+  return 'Database berhasil disiapkan.';
+}
+
+
+function createSheetIfMissing(ss, name, headers) {
+
+  let sheet = ss.getSheetByName(name);
+
+  if (!sheet) {
+    sheet = ss.insertSheet(name);
+  }
+
+  if (sheet.getLastRow() === 0) {
+
+    sheet
+      .getRange(1, 1, 1, headers.length)
+      .setValues([headers]);
+
+    sheet.setFrozenRows(1);
+  }
+}
+
+
+/* =========================================
+   WEB APP
+========================================= */
+
+function doGet(e) {
+
+  const action =
+    e && e.parameter && e.parameter.action
+      ? e.parameter.action
+      : 'ping';
+
+  try {
+
+    switch (action) {
+
+      case 'ping':
+        return json({
+          success: true,
+          message: 'SmartBreak API aktif',
+          time: now()
+        });
+
+      case 'employees':
+        return json({
+          success: true,
+          data: getEmployees()
+        });
+
+      case 'dashboard':
+        return json({
+          success: true,
+          data: getDashboard()
+        });
+
+      case 'report':
+        return json({
+          success: true,
+          data: getReport(e.parameter)
+        });
+
+      case 'recent':
+        return json({
+          success: true,
+          data: getRecent()
+        });
+
+      default:
+        return json({
+          success: false,
+          message: 'Action tidak dikenal'
+        });
+    }
+
+  } catch (err) {
+
+    logError('GET', '', err);
+
+    return json({
+      success: false,
+      message: err.message
+    });
+  }
+}
+
+
+function doPost(e) {
+
+  try {
+
+    const p = e.parameter || {};
+
+    const action = p.action || '';
+
+    if (action === 'break') {
+
+      return json(
+        processBreak(
+          p.id,
+          p.type
+        )
+      );
+    }
+
+    if (action === 'employee') {
+
+      return json(
+        saveEmployee(p)
+      );
+    }
+
+    return json({
+      success: false,
+      message: 'Action POST tidak dikenal'
+    });
+
+  } catch (err) {
+
+    logError(
+      'POST',
+      e && e.parameter ? e.parameter.id : '',
+      err
+    );
+
+    return json({
+      success: false,
+      message: err.message
+    });
+  }
+}
+
+
+/* =========================================
+   EMPLOYEE
+========================================= */
+
+function getEmployees() {
+
+  const sheet =
+    getDB().getSheetByName(SHEET_KARYAWAN);
+
+  if (!sheet || sheet.getLastRow() < 2) {
+    return [];
+  }
+
+  const values =
+    sheet.getDataRange().getValues();
+
+  const headers = values.shift();
+
+  return values
+    .filter(row => row[0])
+    .map(row => {
+
+      let obj = {};
+
+      headers.forEach((h, i) => {
+        obj[h] = row[i];
+      });
+
+      return obj;
+    });
+}
+
+
+function findEmployee(id) {
+
+  const employees = getEmployees();
+
+  return employees.find(
+    e =>
+      String(e.ID).trim().toUpperCase() ===
+      String(id).trim().toUpperCase()
+      ||
+      String(e.QR_ID).trim().toUpperCase() ===
+      String(id).trim().toUpperCase()
+  );
+}
+
+
+function saveEmployee(p) {
+
+  if (!p.id || !p.nama) {
+
+    return {
+      success: false,
+      message: 'ID dan nama wajib diisi.'
+    };
+  }
+
+  const sheet =
+    getDB().getSheetByName(SHEET_KARYAWAN);
+
+  sheet.appendRow([
+    p.id,
+    p.nama,
+    p.jabatan || 'Crew',
+    p.store || '',
+    p.qr_id || p.id,
+    p.status || 'AKTIF'
+  ]);
+
+  return {
+    success: true,
+    message: 'Karyawan berhasil ditambahkan.'
+  };
+}
+
+
+/* =========================================
+   BREAK PROCESS
+========================================= */
+
+function processBreak(id, type) {
+
+  if (!id) {
+
+    return {
+      success: false,
+      message: 'ID karyawan kosong.'
+    };
+  }
+
+  type =
+    String(type || '').toUpperCase();
+
+  if (
+    type !== 'BREAK_OUT' &&
+    type !== 'BREAK_IN'
+  ) {
+
+    return {
+      success: false,
+      message: 'Tipe break tidak valid.'
+    };
+  }
+
+  const employee =
+    findEmployee(id);
+
+  if (!employee) {
+
+    return {
+      success: false,
+      message:
+        'Karyawan dengan ID ' +
+        id +
+        ' tidak ditemukan.'
+    };
+  }
+
+  if (employee.STATUS !== 'AKTIF') {
+
+    return {
+      success: false,
+      message: 'Status karyawan tidak aktif.'
+    };
+  }
+
+
+  const lock =
+    LockService.getScriptLock();
+
+  lock.waitLock(10000);
+
+  try {
+
+    const sheet =
+      getDB().getSheetByName(SHEET_ABSENSI);
+
+    const timestamp = new Date();
+
+    const tanggal =
+      Utilities.formatDate(
+        timestamp,
+        TZ,
+        'yyyy-MM-dd'
+      );
+
+    const jam =
+      Utilities.formatDate(
+        timestamp,
+        TZ,
+        'HH:mm:ss'
+      );
+
+
+    /*
+     * VALIDASI
+     */
+
+    const last =
+      getLastAttendance(id);
+
+
+    if (type === 'BREAK_OUT') {
+
+      if (
+        last &&
+        last.TYPE === 'BREAK_OUT'
+      ) {
+
+        return {
+          success: false,
+          message:
+            'Karyawan masih dalam status BREAK OUT.'
+        };
+      }
+    }
+
+
+    if (type === 'BREAK_IN') {
+
+      if (
+        !last ||
+        last.TYPE !== 'BREAK_OUT'
+      ) {
+
+        return {
+          success: false,
+          message:
+            'Belum ada BREAK OUT.'
+        };
+      }
+    }
+
+
+    sheet.appendRow([
+      timestamp,
+      tanggal,
+      jam,
+      employee.ID,
+      employee.NAMA,
+      employee.STORE,
+      type
+    ]);
+
+
+    logActivity(
+      type,
+      employee.ID,
+      employee.NAMA
+    );
+
+
+    let duration = null;
+    let status = null;
+
+
+    if (type === 'BREAK_IN') {
+
+      duration =
+        calculateDuration(
+          last.TIMESTAMP,
+          timestamp
+        );
+
+      const target =
+        Number(
+          getSetting('TARGET_BREAK') || 60
+        );
+
+      status =
+        duration <= target
+          ? 'TEPAT WAKTU'
+          : 'TERLAMBAT';
+    }
+
+
+    return {
+
+      success: true,
+
+      message:
+        type === 'BREAK_OUT'
+          ? 'BREAK OUT berhasil.'
+          : 'BREAK IN berhasil.',
+
+      employee: {
+        id: employee.ID,
+        nama: employee.NAMA,
+        store: employee.STORE
+      },
+
+      type: type,
+
+      timestamp: timestamp.toISOString(),
+
+      duration: duration,
+
+      status: status
+    };
+
+
+  } finally {
+
+    lock.releaseLock();
+  }
+}
+
+
+/* =========================================
+   LAST ATTENDANCE
+========================================= */
+
+function getLastAttendance(id) {
+
+  const sheet =
+    getDB().getSheetByName(SHEET_ABSENSI);
+
+  if (!sheet || sheet.getLastRow() < 2) {
+    return null;
+  }
+
+  const values =
+    sheet.getDataRange().getValues();
+
+  const headers =
+    values.shift();
+
+  for (let i = values.length - 1; i >= 0; i--) {
+
+    const row = values[i];
+
+    if (
+      String(row[3]).trim().toUpperCase() ===
+      String(id).trim().toUpperCase()
+    ) {
+
+      let obj = {};
+
+      headers.forEach((h, index) => {
+        obj[h] = row[index];
+      });
+
+      return obj;
+    }
+  }
+
+  return null;
+}
+
+
+/* =========================================
+   DASHBOARD
+========================================= */
+
+function getDashboard() {
+
+  const sheet =
+    getDB().getSheetByName(SHEET_ABSENSI);
+
+  if (!sheet || sheet.getLastRow() < 2) {
+
+    return {
+      total: 0,
+      breakOut: 0,
+      breakIn: 0,
+      activeBreak: 0
+    };
+  }
+
+  const values =
+    sheet.getDataRange().getValues();
+
+  values.shift();
+
+  const today =
+    Utilities.formatDate(
+      new Date(),
+      TZ,
+      'yyyy-MM-dd'
+    );
+
+  const todayRows =
+    values.filter(
+      row =>
+        String(row[1]) === today
+    );
+
+
+  const breakOut =
+    todayRows.filter(
+      row => row[6] === 'BREAK_OUT'
+    ).length;
+
+  const breakIn =
+    todayRows.filter(
+      row => row[6] === 'BREAK_IN'
+    ).length;
+
+
+  const activeBreak =
+    breakOut - breakIn;
+
+
+  return {
+
+    total:
+      todayRows.length,
+
+    breakOut:
+      breakOut,
+
+    breakIn:
+      breakIn,
+
+    activeBreak:
+      Math.max(activeBreak, 0),
+
+    date:
+      today
+  };
+}
+
+
+/* =========================================
+   RECENT
+========================================= */
+
+function getRecent() {
+
+  const sheet =
+    getDB().getSheetByName(SHEET_ABSENSI);
+
+  if (!sheet || sheet.getLastRow() < 2) {
+    return [];
+  }
+
+  const values =
+    sheet.getDataRange().getValues();
+
+  values.shift();
+
+  return values
+    .slice(-20)
+    .reverse()
+    .map(row => ({
+
+      timestamp:
+        formatDateTime(row[0]),
+
+      tanggal:
+        row[1],
+
+      jam:
+        row[2],
+
+      id:
+        row[3],
+
+      nama:
+        row[4],
+
+      store:
+        row[5],
+
+      type:
+        row[6]
+
+    }));
+}
+
+
+/* =========================================
+   REPORT
+========================================= */
+
+function getReport(params) {
+
+  const sheet =
+    getDB().getSheetByName(SHEET_ABSENSI);
+
+  if (!sheet || sheet.getLastRow() < 2) {
+    return [];
+  }
+
+  const values =
+    sheet.getDataRange().getValues();
+
+  values.shift();
+
+
+  const result = [];
+
+  const openBreak = {};
+
+
+  values.forEach(row => {
+
+    const timestamp = row[0];
+    const tanggal = row[1];
+    const id = row[3];
+    const nama = row[4];
+    const store = row[5];
+    const type = row[6];
+
+
+    if (
+      params &&
+      params.id &&
+      String(id).toUpperCase() !==
+      String(params.id).toUpperCase()
+    ) {
+      return;
+    }
+
+
+    if (
+      params &&
+      params.store &&
+      String(store).toUpperCase() !==
+      String(params.store).toUpperCase()
+    ) {
+      return;
+    }
+
+
+    if (type === 'BREAK_OUT') {
+
+      openBreak[id] = {
+        timestamp,
+        tanggal,
+        nama,
+        store
+      };
+
+    }
+
+
+    if (
+      type === 'BREAK_IN' &&
+      openBreak[id]
+    ) {
+
+      const out =
+        openBreak[id];
+
+      const duration =
+        calculateDuration(
+          out.timestamp,
+          timestamp
+        );
+
+      const target =
+        Number(
+          getSetting('TARGET_BREAK') || 60
+        );
+
+
+      result.push({
+
+        tanggal:
+          out.tanggal,
+
+        id:
+          id,
+
+        nama:
+          nama,
+
+        store:
+          store,
+
+        out:
+          formatTime(out.timestamp),
+
+        in:
+          formatTime(timestamp),
+
+        duration:
+          duration,
+
+        telat:
+          Math.max(
+            0,
+            duration - target
+          ),
+
+        status:
+          duration <= target
+            ? 'TEPAT WAKTU'
+            : 'TERLAMBAT'
+      });
+
+
+      delete openBreak[id];
+    }
+  });
+
+
+  return result.reverse();
+}
+
+
+/* =========================================
+   SETTING
+========================================= */
+
+function getSetting(key) {
+
+  const sheet =
+    getDB().getSheetByName(SHEET_SETTING);
+
+  if (!sheet || sheet.getLastRow() < 2) {
+    return null;
+  }
+
+  const values =
+    sheet.getDataRange().getValues();
+
+  for (let i = 1; i < values.length; i++) {
+
+    if (
+      String(values[i][0]).trim() ===
+      String(key).trim()
+    ) {
+
+      return values[i][1];
+    }
+  }
+
+  return null;
+}
+
+
+/* =========================================
+   TIME
+========================================= */
+
+function now() {
+
+  return Utilities.formatDate(
+    new Date(),
+    TZ,
+    'yyyy-MM-dd HH:mm:ss'
+  );
+}
+
+
+function formatDateTime(date) {
+
+  return Utilities.formatDate(
+    new Date(date),
+    TZ,
+    'dd/MM/yyyy HH:mm:ss'
+  );
+}
+
+
+function formatTime(date) {
+
+  return Utilities.formatDate(
+    new Date(date),
+    TZ,
+    'HH:mm:ss'
+  );
+}
+
+
+function calculateDuration(start, end) {
+
+  const diff =
+    new Date(end).getTime() -
+    new Date(start).getTime();
+
+  return Math.round(
+    diff / 60000
+  );
+}
+
+
+/* =========================================
+   LOG
+========================================= */
+
+function logActivity(
+  action,
+  id,
+  detail
+) {
+
+  const sheet =
+    getDB().getSheetByName(SHEET_LOG);
+
+  sheet.appendRow([
+    new Date(),
+    action,
+    id,
+    detail
+  ]);
+}
+
+
+function logError(
+  action,
+  id,
+  error
+) {
+
+  try {
+
+    const sheet =
+      getDB().getSheetByName(SHEET_LOG);
+
+    sheet.appendRow([
+      new Date(),
+      'ERROR_' + action,
+      id || '',
+      error.message || String(error)
+    ]);
+
+  } catch (e) {
+
+    console.error(e);
+  }
+}
